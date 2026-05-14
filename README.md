@@ -1,4 +1,4 @@
-# QIDI 3MF generator
+# QIDI 3MF Generator
 
 `qidi_3mf_from_gcode.py` wraps an OrcaSlicer `.gcode` file in a QIDI-style print-ready `.3mf` package.
 
