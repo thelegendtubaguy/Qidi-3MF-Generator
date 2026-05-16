@@ -49,6 +49,27 @@ XY_MOVE_RE = re.compile(r"^(?:G0|G1|G2|G3)\b(?P<params>.*)$", re.IGNORECASE)
 GCODE_PARAM_RE = re.compile(r"([A-Za-z])\s*(-?\d+(?:\.\d+)?)")
 TOOL_SELECT_RE = re.compile(r"^T(?P<tool>\d+)\b", re.IGNORECASE | re.MULTILINE)
 
+SEMICOLON_LIST_SETTINGS = {
+    "extruder_colour",
+    "filament_colour",
+    "filament_colour_type",
+    "filament_ids",
+    "filament_map",
+    "filament_multi_colour",
+    "filament_settings_id",
+    "filament_type",
+    "filament_vendor",
+}
+SEMICOLON_SCALAR_SETTINGS = {
+    "before_layer_change_gcode",
+    "change_extrusion_role_gcode",
+    "change_filament_gcode",
+    "layer_change_gcode",
+    "machine_end_gcode",
+    "machine_start_gcode",
+    "printing_by_object_gcode",
+}
+
 
 @dataclass(frozen=True)
 class FilamentInfo:
@@ -216,21 +237,38 @@ def parse_config_settings(gcode: str) -> dict[str, str | list[str]]:
         value = match.group(2).strip()
         if not key:
             continue
-        settings[key] = parse_setting_value(value)
+        settings[key] = parse_setting_value(key, value)
     return settings
 
 
-def parse_setting_value(value: str) -> str | list[str]:
-    if ";" in value:
-        return value
+def parse_setting_value(key: str, value: str) -> str | list[str]:
+    if key.strip().lower() in SEMICOLON_SCALAR_SETTINGS:
+        return unquote_setting(value)
+    if ";" in value and is_semicolon_list_setting(key, value):
+        return parse_delimited_setting(value, ";")
     if "," not in value:
         return unquote_setting(value)
+    return parse_delimited_setting(value, ",")
+
+
+def parse_delimited_setting(value: str, delimiter: str) -> str | list[str]:
     try:
-        reader = csv.reader([value], skipinitialspace=True)
+        reader = csv.reader([value], delimiter=delimiter, skipinitialspace=True)
         parts = next(reader)
     except csv.Error:
         return unquote_setting(value)
     return [unquote_setting(part.strip()) for part in parts]
+
+
+def is_semicolon_list_setting(key: str, value: str) -> bool:
+    normalized_key = key.strip().lower()
+    if normalized_key in SEMICOLON_SCALAR_SETTINGS:
+        return False
+    if normalized_key in SEMICOLON_LIST_SETTINGS:
+        return True
+    if value.startswith('"') and '";"' in value:
+        return True
+    return normalized_key.startswith("filament_")
 
 
 def unquote_setting(value: str) -> str:

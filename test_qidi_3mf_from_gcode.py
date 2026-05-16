@@ -92,12 +92,26 @@ T1
 """
         metadata = parse_gcode_metadata(gcode)
 
+        self.assertEqual(metadata.settings["filament_type"], ["PLA", "PETG"])
+        self.assertEqual(metadata.settings["filament_colour"], ["#111111", "#222222"])
+        self.assertEqual(metadata.settings["filament_ids"], ["A", "B"])
         self.assertEqual([filament.filament_type for filament in metadata.filaments], ["PLA", "PETG"])
         self.assertEqual([filament.color for filament in metadata.filaments], ["#111111", "#222222"])
         self.assertEqual([filament.filament_id for filament in metadata.filaments], ["A", "B"])
 
 
 class ParserRobustnessTest(unittest.TestCase):
+    def test_settings_parser_preserves_scalar_gcode_with_semicolons(self):
+        settings = parse_config_settings(
+            r"""
+; machine_start_gcode = ;===== PRINT_PHASE_INIT =====\nG28\n;===== PRINT_START =====\n; comment, with comma
+; filament_start_gcode = "; Filament gcode\n";"; Filament gcode\n"
+"""
+        )
+
+        self.assertEqual(settings["machine_start_gcode"], ";===== PRINT_PHASE_INIT =====\\nG28\\n;===== PRINT_START =====\\n; comment, with comma")
+        self.assertEqual(settings["filament_start_gcode"], ["; Filament gcode\\n", "; Filament gcode\\n"])
+
     def test_settings_parser_skips_thumbnail_payload(self):
         settings = parse_config_settings(
             """
