@@ -7,8 +7,8 @@ import ast
 import base64
 import csv
 import hashlib
-import io
 import json
+import math
 import re
 import sys
 import zipfile
@@ -21,6 +21,7 @@ from xml.sax.saxutils import escape, quoteattr
 
 DEFAULT_CLIENT_VERSION = "02.05.02.50"
 DEFAULT_PRINTER_MODEL = "X-Max 4"
+WIPE_TOWER_ID = 1000
 
 # 1x1 transparent PNG fallback. OrcaSlicer can embed PNG thumbnails in G-code;
 # the script extracts the largest embedded thumbnail when --thumbnail is omitted.
@@ -31,12 +32,13 @@ PLACEHOLDER_PNG = base64.b64decode(
 SETTING_RE = re.compile(r"^;\s*([^=]+?)\s*=\s*(.*)$")
 TOTAL_LAYER_RE = re.compile(r"^;\s*total layer number:\s*(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
 SET_TOTAL_LAYER_RE = re.compile(r"\bSET_PRINT_STATS_INFO\s+[^\n;]*TOTAL_LAYER\s*=\s*(\d+)", re.IGNORECASE)
-M73_RE = re.compile(r"^M73\s+.*?\bP(?P<p>\d+(?:\.\d+)?)\b.*?\bR(?P<r>\d+(?:\.\d+)?)\b", re.IGNORECASE | re.MULTILINE)
+M73_LINE_RE = re.compile(r"^M73\b(?P<params>.*)$", re.IGNORECASE | re.MULTILINE)
 ESTIMATE_RE = re.compile(r"^;\s*estimated printing time \([^)]*\)\s*=\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-EXCLUDE_OBJECT_RE = re.compile(
-    r"^EXCLUDE_OBJECT_DEFINE\s+NAME=(?P<name>\S+)(?:\s+CENTER=(?P<center>\S+))?(?:\s+POLYGON=(?P<polygon>\[.*\]))?",
+FIRST_LAYER_ESTIMATE_RE = re.compile(
+    r"^;\s*estimated first layer printing time \([^)]*\)\s*=\s*(.+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+EXCLUDE_OBJECT_LINE_RE = re.compile(r"^EXCLUDE_OBJECT_DEFINE\b(?P<params>.*)$", re.IGNORECASE | re.MULTILINE)
 PRINTING_OBJECT_RE = re.compile(
     r"^;\s*printing object\s+(?P<name>.+?)\s+id:(?P<object_id>\S+)\s+copy\s+(?P<copy>\S+)",
     re.IGNORECASE | re.MULTILINE,
@@ -82,6 +84,16 @@ class GcodeMetadata:
     settings: dict[str, str | list[str]]
 
 
+def positive_int_arg(raw: str) -> str:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return str(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bundle an OrcaSlicer/QIDI-flavored G-code file into a QIDI-style print-ready .3mf package.",
@@ -105,8 +117,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--plate-index",
+        type=positive_int_arg,
         default="1",
-        help="Plate index used in QIDI metadata paths. Defaults to 1.",
+        help="Positive integer plate index used in QIDI metadata paths. Defaults to 1.",
     )
     parser.add_argument(
         "--thumbnail",
@@ -136,12 +149,17 @@ def main() -> int:
     gcode_bytes = gcode_path.read_bytes()
     gcode_text = gcode_bytes.decode("utf-8", errors="replace")
     metadata = parse_gcode_metadata(gcode_text, printer_model_override=args.printer_model)
-    thumbnail = read_thumbnail(args.thumbnail) if args.thumbnail else extract_thumbnail_png(gcode_text) or PLACEHOLDER_PNG
+    try:
+        thumbnail = read_thumbnail(args.thumbnail) if args.thumbnail else extract_thumbnail_png(gcode_text) or PLACEHOLDER_PNG
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    package_gcode_bytes = qidi_package_gcode_bytes(gcode_bytes, metadata)
     write_qidi_3mf(
         output_path=output_path,
-        gcode_bytes=gcode_bytes,
+        gcode_bytes=package_gcode_bytes,
         source_name=gcode_path.name,
         metadata=metadata,
         client_version=args.client_version,
@@ -161,10 +179,11 @@ def parse_gcode_metadata(gcode: str, printer_model_override: str | None = None) 
     printer_model = printer_model_override or normalize_printer_model(first_setting(settings, "printer_model") or DEFAULT_PRINTER_MODEL)
     nozzle_diameter = parse_float(first_setting(settings, "nozzle_diameter"), 0.4)
     timelapse_type = first_setting(settings, "timelapse_type") or "0"
-    first_layer_time = parse_float(first_setting(settings, "first_layer_time"), 0.0)
-    filaments = parse_filaments(settings)
+    first_layer_time = parse_first_layer_time(gcode, settings)
+    explicit_filament_sequence = parse_filament_sequence(gcode)
+    filaments = parse_filaments(settings, used_filament_indices=explicit_filament_sequence)
+    filament_sequence = normalize_filament_sequence(explicit_filament_sequence, filaments)
     objects = parse_objects(gcode, settings)
-    filament_sequence = parse_filament_sequence(gcode)
     return GcodeMetadata(
         total_layers=total_layers,
         prediction_seconds=prediction_seconds,
@@ -181,7 +200,15 @@ def parse_gcode_metadata(gcode: str, printer_model_override: str | None = None) 
 
 def parse_config_settings(gcode: str) -> dict[str, str | list[str]]:
     settings: dict[str, str | list[str]] = {}
+    in_thumbnail = False
     for line in gcode.splitlines():
+        if THUMBNAIL_BEGIN_RE.match(line):
+            in_thumbnail = True
+            continue
+        if in_thumbnail:
+            if THUMBNAIL_END_RE.match(line):
+                in_thumbnail = False
+            continue
         match = SETTING_RE.match(line)
         if not match:
             continue
@@ -194,6 +221,8 @@ def parse_config_settings(gcode: str) -> dict[str, str | list[str]]:
 
 
 def parse_setting_value(value: str) -> str | list[str]:
+    if ";" in value:
+        return value
     if "," not in value:
         return unquote_setting(value)
     try:
@@ -215,15 +244,6 @@ def first_setting(settings: dict[str, str | list[str]], key: str, default: str |
     if isinstance(value, list):
         return value[0] if value else default
     return value if value not in (None, "") else default
-
-
-def setting_list(settings: dict[str, str | list[str]], key: str) -> list[str]:
-    value = settings.get(key)
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
 
 
 def split_setting_values(value: str | list[str] | None) -> list[str]:
@@ -271,13 +291,36 @@ def parse_prediction_seconds(gcode: str) -> int:
         parsed = parse_duration_seconds(match.group(1))
         if parsed > 0:
             return parsed
-    m73_values = [(float(match.group("p")), float(match.group("r"))) for match in M73_RE.finditer(gcode)]
+    m73_values: list[tuple[float, float]] = []
+    for match in M73_LINE_RE.finditer(gcode):
+        params = parse_gcode_param_numbers(match.group("params"))
+        progress = params.get("P")
+        remaining = params.get("R")
+        if progress is not None and remaining is not None:
+            m73_values.append((progress, remaining))
     if m73_values:
         # M73 R is minutes remaining. Prefer the earliest low-progress value.
         low_progress = [remaining for progress, remaining in m73_values if progress <= 1]
         remaining_minutes = max(low_progress or [remaining for _, remaining in m73_values])
         return int(round(remaining_minutes * 60))
     return 0
+
+
+def parse_first_layer_time(gcode: str, settings: dict[str, str | list[str]]) -> float:
+    configured = parse_float(first_setting(settings, "first_layer_time"), 0.0)
+    if configured > 0:
+        return configured
+    match = FIRST_LAYER_ESTIMATE_RE.search(gcode)
+    if match:
+        parsed = parse_duration_seconds(match.group(1))
+        if parsed > 0:
+            return float(parsed)
+    return configured
+
+
+def parse_gcode_param_numbers(raw_params: str) -> dict[str, float]:
+    command_params = raw_params.split(";", 1)[0]
+    return {key.upper(): float(value) for key, value in GCODE_PARAM_RE.findall(command_params)}
 
 
 def parse_duration_seconds(raw: str) -> int:
@@ -315,18 +358,35 @@ def normalize_printer_model(raw: str) -> str:
     return model or DEFAULT_PRINTER_MODEL
 
 
-def parse_filaments(settings: dict[str, str | list[str]]) -> tuple[FilamentInfo, ...]:
+def parse_filaments(
+    settings: dict[str, str | list[str]],
+    used_filament_indices: Iterable[int] | None = None,
+) -> tuple[FilamentInfo, ...]:
     colors = split_setting_list(settings, "filament_colour") or split_setting_list(settings, "extruder_colour") or split_setting_list(settings, "default_filament_colour") or ["#FFFFFF"]
     types = split_setting_list(settings, "filament_type") or ["PLA"]
     filament_ids = split_setting_list(settings, "filament_ids")
     vendors = split_setting_list(settings, "filament_vendor")
     volume_types = split_setting_list(settings, "nozzle_volume_type") or split_setting_list(settings, "default_nozzle_volume_type") or ["Standard"]
-    used_m = [parse_float(value, 0.0) / 1000.0 for value in setting_list(settings, "filament used [mm]")]
-    used_g = [parse_float(value, 0.0) for value in setting_list(settings, "filament used [g]")]
+    used_m = [parse_float(value, 0.0) / 1000.0 for value in split_setting_list(settings, "filament used [mm]")]
+    used_g = [parse_float(value, 0.0) for value in split_setting_list(settings, "filament used [g]")]
     total_used_g = parse_float(first_setting(settings, "total filament used [g]"), 0.0)
-    count = max(len(colors), len(types), len(filament_ids), len(vendors), len(volume_types), len(used_m), len(used_g), 1)
+    requested_indices = {index for index in (used_filament_indices or ()) if index > 0}
+    count = max(
+        len(colors),
+        len(types),
+        len(filament_ids),
+        len(vendors),
+        len(volume_types),
+        len(used_m),
+        len(used_g),
+        max(requested_indices, default=0),
+        1,
+    )
+    included_indices = used_filament_indices_for_metadata(requested_indices, used_m, used_g, count)
     filaments = []
     for index in range(count):
+        if index + 1 not in included_indices:
+            continue
         color = get_repeated(colors, index, "#FFFFFF") or "#FFFFFF"
         if not color.startswith("#") or len(color) not in (4, 7, 9):
             color = "#FFFFFF"
@@ -353,6 +413,31 @@ def parse_filaments(settings: dict[str, str | list[str]]) -> tuple[FilamentInfo,
     return tuple(filaments)
 
 
+def used_filament_indices_for_metadata(
+    requested_indices: set[int],
+    used_m: list[float],
+    used_g: list[float],
+    count: int,
+) -> set[int]:
+    usage_indices = positive_usage_indices(used_m, used_g, count)
+    explicit_indices = {index for index in requested_indices if 1 <= index <= count}
+    if explicit_indices:
+        return explicit_indices | usage_indices
+    return usage_indices or set(range(1, count + 1))
+
+
+def positive_usage_indices(used_m: list[float], used_g: list[float], count: int) -> set[int]:
+    has_per_filament_usage = len(used_m) >= count or len(used_g) >= count
+    if not has_per_filament_usage:
+        return set()
+    return {
+        index + 1
+        for index in range(count)
+        if (used_m[index] if index < len(used_m) else 0.0) > 0
+        or (used_g[index] if index < len(used_g) else 0.0) > 0
+    }
+
+
 def get_repeated(values: list[str], index: int, default: str) -> str:
     if not values:
         return default
@@ -370,29 +455,120 @@ def get_float_repeated(values: list[float], index: int, default: float) -> float
 
 
 def parse_float(raw: str | None, default: float) -> float:
+    fallback = default if math.isfinite(default) else 0.0
+    value = parse_optional_float(raw)
+    return value if value is not None else fallback
+
+
+def parse_optional_float(raw: str | None) -> float | None:
     if raw is None:
-        return default
+        return None
     try:
-        return float(str(raw).strip().strip('"'))
+        value = float(str(raw).strip().strip('"'))
     except ValueError:
-        return default
+        return None
+    return value if math.isfinite(value) else None
+
+
+def parse_gcode_key_values(raw_params: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    position = 0
+    length = len(raw_params)
+    while position < length:
+        while position < length and raw_params[position].isspace():
+            position += 1
+        key_start = position
+        while position < length and raw_params[position] not in "= \t\r\n":
+            position += 1
+        key = raw_params[key_start:position].strip().upper()
+        while position < length and raw_params[position].isspace():
+            position += 1
+        if position >= length or raw_params[position] != "=":
+            while position < length and not raw_params[position].isspace():
+                position += 1
+            continue
+        position += 1
+        while position < length and raw_params[position].isspace():
+            position += 1
+        value, position = read_gcode_parameter_value(raw_params, position)
+        if key:
+            params[key] = value
+    return params
+
+
+def read_gcode_parameter_value(raw_params: str, position: int) -> tuple[str, int]:
+    if position >= len(raw_params):
+        return "", position
+    if raw_params[position] in {'"', "'"}:
+        return read_quoted_gcode_parameter(raw_params, position)
+    if raw_params[position] == "[":
+        return read_bracketed_gcode_parameter(raw_params, position)
+    start = position
+    while position < len(raw_params) and not raw_params[position].isspace():
+        position += 1
+    return raw_params[start:position], position
+
+
+def read_quoted_gcode_parameter(raw_params: str, position: int) -> tuple[str, int]:
+    quote = raw_params[position]
+    position += 1
+    chars: list[str] = []
+    while position < len(raw_params):
+        char = raw_params[position]
+        if char == "\\" and position + 1 < len(raw_params):
+            chars.append(raw_params[position + 1])
+            position += 2
+            continue
+        if char == quote:
+            return "".join(chars), position + 1
+        chars.append(char)
+        position += 1
+    return "".join(chars), position
+
+
+def read_bracketed_gcode_parameter(raw_params: str, position: int) -> tuple[str, int]:
+    start = position
+    depth = 0
+    quote: str | None = None
+    while position < len(raw_params):
+        char = raw_params[position]
+        if quote is not None:
+            if char == "\\" and position + 1 < len(raw_params):
+                position += 2
+                continue
+            if char == quote:
+                quote = None
+            position += 1
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                position += 1
+                break
+        position += 1
+    return raw_params[start:position].strip(), position
 
 
 def parse_objects(gcode: str, settings: dict[str, str | list[str]]) -> tuple[ObjectInfo, ...]:
     objects: list[ObjectInfo] = []
     seen: set[str] = set()
-    for match in EXCLUDE_OBJECT_RE.finditer(gcode):
-        name = match.group("name")
-        if name in seen:
+    for match in EXCLUDE_OBJECT_LINE_RE.finditer(gcode):
+        params = parse_gcode_key_values(match.group("params"))
+        name = params.get("NAME")
+        if not name or name in seen:
             continue
         seen.add(name)
-        bbox = parse_polygon_bbox(match.group("polygon"))
+        bbox = parse_polygon_bbox(params.get("POLYGON"))
         area = bbox_area(bbox) if bbox else None
         objects.append(ObjectInfo(identify_id=len(objects) + 1, name=name, bbox=bbox, area=area))
     if not objects:
         objects.extend(parse_objects_from_comments(gcode))
     if is_enabled(first_setting(settings, "enable_prime_tower")):
-        wipe = parse_wipe_tower_object(settings, identify_id=len(objects) + 1)
+        wipe = parse_wipe_tower_object(settings)
         if wipe is not None and wipe.name not in {obj.name for obj in objects}:
             objects.append(wipe)
     return tuple(objects)
@@ -401,6 +577,8 @@ def parse_objects(gcode: str, settings: dict[str, str | list[str]]) -> tuple[Obj
 def parse_objects_from_comments(gcode: str) -> list[ObjectInfo]:
     bboxes: dict[str, list[float]] = {}
     current_name: str | None = None
+    current_x: float | None = None
+    current_y: float | None = None
     for raw_line in gcode.splitlines():
         object_match = PRINTING_OBJECT_RE.match(raw_line)
         if object_match:
@@ -412,17 +590,21 @@ def parse_objects_from_comments(gcode: str) -> list[ObjectInfo]:
         if raw_line.lower().startswith("; stop printing object"):
             current_name = None
             continue
-        if current_name is None:
-            continue
         params = parse_xy_params(raw_line)
         if params is None:
             continue
         x, y = params
+        if x is not None:
+            current_x = x
+        if y is not None:
+            current_y = y
+        if current_name is None or current_x is None or current_y is None:
+            continue
         bbox = bboxes[current_name]
-        bbox[0] = min(bbox[0], x)
-        bbox[1] = min(bbox[1], y)
-        bbox[2] = max(bbox[2], x)
-        bbox[3] = max(bbox[3], y)
+        bbox[0] = min(bbox[0], current_x)
+        bbox[1] = min(bbox[1], current_y)
+        bbox[2] = max(bbox[2], current_x)
+        bbox[3] = max(bbox[3], current_y)
     objects: list[ObjectInfo] = []
     for name, bbox_values in bboxes.items():
         bbox = tuple(bbox_values) if bbox_values[0] != float("inf") else None
@@ -435,26 +617,25 @@ def normalize_object_name(name: str, object_id: str, copy: str) -> str:
     return f"{safe_name}_id_{object_id}_copy_{copy}"
 
 
-def parse_xy_params(raw_line: str) -> tuple[float, float] | None:
+def parse_xy_params(raw_line: str) -> tuple[float | None, float | None] | None:
     command = raw_line.split(";", 1)[0].strip()
     match = XY_MOVE_RE.match(command)
     if not match:
         return None
-    params = {key.upper(): float(value) for key, value in GCODE_PARAM_RE.findall(match.group("params"))}
-    if "X" not in params or "Y" not in params:
+    params = parse_gcode_param_numbers(match.group("params"))
+    if "X" not in params and "Y" not in params:
         return None
-    return (params["X"], params["Y"])
+    return (params.get("X"), params.get("Y"))
 
 
-def parse_wipe_tower_object(settings: dict[str, str | list[str]], identify_id: int) -> ObjectInfo | None:
-    identify_id = 1000
-    x = parse_float(first_setting(settings, "wipe_tower_x"), float("nan"))
-    y = parse_float(first_setting(settings, "wipe_tower_y"), float("nan"))
+def parse_wipe_tower_object(settings: dict[str, str | list[str]]) -> ObjectInfo | None:
+    x = parse_optional_float(first_setting(settings, "wipe_tower_x"))
+    y = parse_optional_float(first_setting(settings, "wipe_tower_y"))
     width = parse_float(first_setting(settings, "prime_tower_width"), 0.0)
-    if x != x or y != y or width <= 0:
+    if x is None or y is None or width <= 0:
         return None
     bbox = (x, y, x + width, y + width)
-    return ObjectInfo(identify_id=identify_id, name="wipe_tower", bbox=bbox, area=bbox_area(bbox))
+    return ObjectInfo(identify_id=WIPE_TOWER_ID, name="wipe_tower", bbox=bbox, area=bbox_area(bbox))
 
 
 def is_enabled(value: str | None) -> bool:
@@ -471,6 +652,21 @@ def parse_filament_sequence(gcode: str) -> tuple[int, ...]:
     return tuple(sequence)
 
 
+def normalize_filament_sequence(
+    explicit_sequence: Iterable[int],
+    filaments: Iterable[FilamentInfo],
+) -> tuple[int, ...]:
+    sequence = list(explicit_sequence)
+    implicit_t0_used = any(filament.index == 1 and filament_has_usage(filament) for filament in filaments)
+    if implicit_t0_used and sequence and sequence[0] != 1:
+        sequence.insert(0, 1)
+    return tuple(sequence)
+
+
+def filament_has_usage(filament: FilamentInfo) -> bool:
+    return filament.used_m > 0 or filament.used_g > 0
+
+
 def parse_polygon_bbox(raw_polygon: str | None) -> tuple[float, float, float, float] | None:
     if not raw_polygon:
         return None
@@ -482,9 +678,12 @@ def parse_polygon_bbox(raw_polygon: str | None) -> tuple[float, float, float, fl
     for point in polygon:
         if isinstance(point, (list, tuple)) and len(point) >= 2:
             try:
-                points.append((float(point[0]), float(point[1])))
+                x = float(point[0])
+                y = float(point[1])
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(x) and math.isfinite(y):
+                points.append((x, y))
     if not points:
         return None
     xs = [point[0] for point in points]
@@ -531,8 +730,66 @@ def extract_thumbnail_png(gcode: str) -> bytes | None:
 def read_thumbnail(path: Path) -> bytes:
     data = path.read_bytes()
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise SystemExit(f"Thumbnail is not a PNG: {path}")
+        raise ValueError(f"Thumbnail is not a PNG: {path}")
     return data
+
+
+def qidi_package_gcode_bytes(gcode_bytes: bytes, metadata: GcodeMetadata) -> bytes:
+    if not metadata.objects or b"EXCLUDE_OBJECT_DEFINE" in gcode_bytes:
+        return gcode_bytes
+    definitions = exclude_object_define_lines(metadata.objects)
+    if not definitions:
+        return gcode_bytes
+    gcode = gcode_bytes.decode("utf-8", errors="replace")
+    insertion = "\n".join(definitions) + "\n"
+    marker = "; EXECUTABLE_BLOCK_START"
+    marker_index = gcode.find(marker)
+    if marker_index >= 0:
+        line_end = gcode.find("\n", marker_index)
+        if line_end >= 0:
+            gcode = gcode[: line_end + 1] + insertion + gcode[line_end + 1 :]
+        else:
+            gcode = gcode + "\n" + insertion
+    else:
+        gcode = insertion + gcode
+    return gcode.encode("utf-8")
+
+
+def exclude_object_define_lines(objects: Iterable[ObjectInfo]) -> list[str]:
+    lines = []
+    seen: set[str] = set()
+    for obj in objects:
+        if obj.bbox is None:
+            continue
+        name = exclude_object_define_name(obj)
+        if name in seen:
+            continue
+        seen.add(name)
+        min_x, min_y, max_x, max_y = obj.bbox
+        if not all(math.isfinite(value) for value in obj.bbox):
+            continue
+        center_x = (min_x + max_x) / 2.0
+        center_y = (min_y + max_y) / 2.0
+        polygon = (
+            f"[[{format_float(min_x)},{format_float(min_y)}],"
+            f"[{format_float(max_x)},{format_float(min_y)}],"
+            f"[{format_float(max_x)},{format_float(max_y)}],"
+            f"[{format_float(min_x)},{format_float(max_y)}],"
+            f"[{format_float(min_x)},{format_float(min_y)}]]"
+        )
+        lines.append(
+            "EXCLUDE_OBJECT_DEFINE "
+            f"NAME={name} "
+            f"CENTER={format_float(center_x)},{format_float(center_y)} "
+            f"POLYGON={polygon}"
+        )
+    return lines
+
+
+def exclude_object_define_name(obj: ObjectInfo) -> str:
+    if obj.name == "wipe_tower":
+        return "wipe_tower_area"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", obj.name).strip("_") or f"object_{obj.identify_id}"
 
 
 def write_qidi_3mf(
@@ -695,7 +952,7 @@ def slice_info_xml(metadata: GcodeMetadata, client_version: str, plate_index: st
     filament_maps = qidi_filament_maps(metadata)
     limit_filament_maps = " ".join("0" for _ in metadata.filaments) or "0"
     last_layer = max(metadata.total_layers - 1, 0)
-    layer_filaments = " ".join(str(index) for index in range(len(metadata.filaments))) or "0"
+    layer_filaments = " ".join(str(filament.index - 1) for filament in metadata.filaments) or "0"
     label_object_enabled = "true" if metadata.objects else "false"
     layer_list = f"      <layer_filament_list filament_list={quoteattr(layer_filaments)} layer_ranges=\"0 {last_layer}\" />"
     return f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -752,7 +1009,7 @@ def plate_json(metadata: GcodeMetadata) -> str:
         "bed_type": normalize_bed_type(first_setting(metadata.settings, "curr_bed_type") or "textured_plate"),
         "filament_colors": [filament.color for filament in metadata.filaments],
         "filament_ids": [filament.index - 1 for filament in metadata.filaments],
-        "first_extruder": 0,
+        "first_extruder": first_extruder(metadata),
         "first_layer_time": metadata.first_layer_time,
         "is_seq_print": False,
         "nozzle_diameter": metadata.nozzle_diameter,
@@ -768,10 +1025,20 @@ def project_settings_json(metadata: GcodeMetadata) -> str:
 def qidi_filament_maps(metadata: GcodeMetadata) -> str:
     maps = split_setting_values(metadata.settings.get("filament_map"))
     if not maps:
-        maps = ["1" for _ in metadata.filaments]
-    if len(maps) < len(metadata.filaments):
-        maps.extend([maps[-1] if maps else "1"] * (len(metadata.filaments) - len(maps)))
-    return " ".join(maps[: len(metadata.filaments)]) or "1"
+        return " ".join("1" for _ in metadata.filaments) or "1"
+    selected_maps = []
+    for filament in metadata.filaments:
+        map_index = filament.index - 1
+        selected_maps.append(maps[map_index] if map_index < len(maps) else maps[-1])
+    return " ".join(selected_maps) or "1"
+
+
+def first_extruder(metadata: GcodeMetadata) -> int:
+    if metadata.filament_sequence:
+        return metadata.filament_sequence[0] - 1
+    if metadata.filaments:
+        return metadata.filaments[0].index - 1
+    return 0
 
 
 def normalize_bed_type(raw: str) -> str:
@@ -784,6 +1051,8 @@ def normalize_bed_type(raw: str) -> str:
 
 
 def format_float(value: float) -> str:
+    if not math.isfinite(value):
+        return "0"
     return f"{value:.6f}".rstrip("0").rstrip(".")
 
 
